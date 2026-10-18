@@ -1,14 +1,11 @@
 """Regression checks for contractops (synthetic data, deterministic)."""
-import sqlite3
 
 import pytest
 
 from contractops import clauses, renewals
 from contractops.audit import AuditLog
-from contractops.demo_helpers import (clause_report, default_questions,
-                                      renewal_pipeline, risk_summary)
-from contractops.escalation import (ConfirmationGate, escalate, gate_required,
-                                    tier_for)
+from contractops.demo_helpers import clause_report, default_questions, renewal_pipeline, risk_summary
+from contractops.escalation import ConfirmationGate, escalate, gate_required, tier_for
 from contractops.feedback import FeedbackError, FeedbackStore
 from contractops.orchestrator import Orchestrator
 from contractops.pii import PIIScrubber
@@ -17,8 +14,7 @@ from contractops.sop_rag import answer as rag_answer
 from contractops.sop_rag import load_chunks
 from contractops.telemetry import REF_TODAY, seed_db
 from contractops.text2sql import EscalationNeeded, detect_intent, to_sql
-from contractops.views import (GatewayError, create_views, run_readonly,
-                               MAX_ROWS)
+from contractops.views import MAX_ROWS, GatewayError, create_views, run_readonly
 
 
 @pytest.fixture()
@@ -173,8 +169,11 @@ def test_far_future_has_no_urgency():
 
 
 def test_renewal_ranking_anchor_first(orch):
-    top = orch.rank_renewals(5)["renewals"][0]
-    assert top["contract_id"] == "CTR-1007"
+    ranked = orch.rank_renewals(5)["renewals"]
+    # The lapsed CTR-1003 auto-renewal leads (control failure, SOP-02);
+    # CTR-1007 is the top undecided renewal.
+    assert ranked[0]["contract_id"] == "CTR-1003" and ranked[0]["decision"] == "lapsed"
+    assert ranked[1]["contract_id"] == "CTR-1007"
 
 
 # ---- gateway security ------------------------------------------------------
@@ -339,7 +338,7 @@ def test_pii_scrubber_redacts():
     assert "jane@northgate.example" not in clean
     assert "555-123-4567" not in clean
     assert "123-45-6789" not in clean
-    assert counts == {"email": 1, "phone": 1, "ssn": 1}
+    assert counts == {"email": 1, "phone": 1, "ssn": 1, "card": 0}
 
 
 def test_feedback_stores_scrubbed_text():
@@ -404,7 +403,7 @@ def test_demo_risk_summary():
 
 def test_demo_renewal_pipeline():
     pipe = renewal_pipeline(3)
-    assert pipe[0]["contract_id"] == "CTR-1007"
+    assert [p["contract_id"] for p in pipe] == ["CTR-1003", "CTR-1007", "CTR-1012"]
     assert len(pipe) == 3
 
 
@@ -416,3 +415,54 @@ def test_demo_clause_report():
 def test_demo_default_questions():
     qs = default_questions()
     assert len(qs) >= 4 and all(isinstance(q, str) for q in qs)
+
+
+# ---------- review fixes (grokbot-portfolio, 2026-10-18) ----------
+from contractops import clauses as review_clauses  # noqa: E402
+from contractops import renewals as review_renewals  # noqa: E402
+
+
+def _fails(clause_type, text):
+    return review_clauses.score_clause(clause_type, text)["score"] > 0
+
+
+def test_review_uncapped_mutual_indemnity_fails():
+    assert _fails("indemnity", "Mutual indemnity, uncapped.")
+    assert _fails("indemnity", "Indemnity is not mutual; Supplier capped at fees.")
+    assert not _fails("indemnity", "Mutual indemnity for IP claims, capped at fees paid.")
+
+
+def test_review_liability_cap_must_be_capped_and_mutual():
+    assert _fails("liability_cap", "Unlimited liability for Supplier.")
+    assert _fails("liability_cap", "Liability cap applies to Customer only, 24 months of fees.")
+    assert not _fails("liability_cap", "Mutual liability cap at 12 months of fees.")
+
+
+def test_review_standard_notice_wording_is_parsed():
+    assert not _fails("auto_renewal", "Renews annually unless either party gives ninety (90) days' written notice.")
+    assert not _fails("auto_renewal", "Renews unless 90 days prior written notice is given.")
+    assert not _fails("termination", "Either party may terminate for convenience on 120 days\u2019 notice.")
+    assert _fails("auto_renewal", "Renews unless 30 days' written notice is given.")
+
+
+def test_review_payment_days_from_invoice_is_checked():
+    assert _fails("payment_terms", "Payment due 90 days from invoice.")
+    assert not _fails("payment_terms", "Payment due 45 days after the date of invoice.")
+
+
+def test_review_renewal_value_term_is_bounded():
+    big = review_renewals.priority(5_000_000, 100, "2026-10-01", "2026-10-18")
+    assert big["priority_score"] == 100.0
+
+
+def test_review_lapsed_renewal_stays_in_pipeline(orch):
+    ranked = orch.rank_renewals(10)["renewals"]
+    lapsed = [r for r in ranked if r["contract_id"] == "CTR-1003"]
+    assert lapsed and lapsed[0]["flag"].startswith("lapsed renewal")
+    ctr_1007 = next(r for r in ranked if r["contract_id"] == "CTR-1007")
+    assert ctr_1007["past_notice_deadline"] is True   # 21 days left, 30-day notice
+
+
+def test_review_card_numbers_are_redacted_and_dates_kept():
+    clean, counts = PIIScrubber().scrub("card 4111 1111 1111 1111 on 2026-10-18 2026-10-25")
+    assert clean == "card [REDACTED-CARD] on 2026-10-18 2026-10-25" and counts["card"] == 1

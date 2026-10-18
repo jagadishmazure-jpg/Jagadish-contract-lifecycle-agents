@@ -62,9 +62,12 @@ class Orchestrator:
             "WHERE status = 'active'").fetchall()
         ranked = []
         for (cid, value) in rows:
+            # Lapsed renewals stay in the pipeline: SOP-02 treats a lapsed
+            # auto-renewal as a control failure, not a closed item.
             ren = cur.execute(
-                "SELECT expiry_date FROM renewals WHERE contract_id = ? "
-                "AND decision = 'undecided' ORDER BY expiry_date LIMIT 1",
+                "SELECT expiry_date, decision, notice_days FROM renewals "
+                "WHERE contract_id = ? AND decision IN ('undecided', 'lapsed') "
+                "ORDER BY expiry_date LIMIT 1",
                 (cid,)).fetchone()
             if ren is None:
                 continue
@@ -74,7 +77,11 @@ class Orchestrator:
             from .telemetry import REF_TODAY
             pr = renewal_mod.priority(value, risk, ren[0],
                                       REF_TODAY.isoformat())
-            ranked.append({"contract_id": cid, **pr})
+            entry = {"contract_id": cid, **pr, "decision": ren[1],
+                     "past_notice_deadline": pr["days_to_expiry"] < ren[2]}
+            if ren[1] == "lapsed":
+                entry["flag"] = "lapsed renewal: control failure (SOP-02)"
+            ranked.append(entry)
         ranked.sort(key=lambda r: -r["priority_score"])
         return {"renewals": ranked[:limit]}
 

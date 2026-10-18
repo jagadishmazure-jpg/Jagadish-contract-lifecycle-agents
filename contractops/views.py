@@ -5,10 +5,12 @@ Security rules (cited in errors and README):
   SEC-SELECT-02 — write keywords are rejected even when the literal-strip
                   scan sees them outside string literals.
   SEC-SELECT-03 — queries may only reference the four published views
-                  (FROM/JOIN allowlist); a SQLite authorizer backstop
-                  (contractops.authz) denies writes, DDL, and sqlite_master
-                  even if the text check is evaded; rows are capped at
-                  MAX_ROWS at fetch time.
+                  (FROM/JOIN allowlist). The SQLite authorizer
+                  (contractops.authz) enforces this independently: a base
+                  table is readable only on behalf of a published view,
+                  never when named directly, and sqlite_master, writes and
+                  DDL are always denied. Rows are capped at MAX_ROWS at
+                  fetch time.
 """
 from __future__ import annotations
 
@@ -27,20 +29,6 @@ ALLOWED_VIEWS = (
     "v_upcoming_renewals",
     "v_obligation_status",
     "v_clause_risk",
-)
-
-# Base tables the allowed views expand to. SQLite's authorizer sees these
-# reads during view expansion, so they must be permitted for the views to
-# work at all. Direct references to them in query text are still denied by
-# the FROM/JOIN allowlist below.
-_VIEW_BACKING_TABLES = (
-    "contracts",
-    "counterparties",
-    "clauses",
-    "renewals",
-    "obligations",
-    "_contract_risk",
-    "_renewal_priority",
 )
 
 _WRITE_KEYWORDS = ("insert", "update", "delete", "drop", "alter", "create",
@@ -69,7 +57,7 @@ def create_views(con: sqlite3.Connection) -> None:
     cur.execute("DELETE FROM _contract_risk")
     rows = cur.execute(
         "SELECT contract_id, annual_value FROM contracts").fetchall()
-    for (cid, value) in rows:
+    for (cid, _value) in rows:
         clauses = cur.execute(
             "SELECT clause_id, clause_type, text FROM clauses "
             "WHERE contract_id = ?", (cid,)).fetchall()
@@ -208,10 +196,12 @@ def _referenced_tables(sql: str) -> set:
             token = item.strip().split()
             if not token:
                 continue
-            name = _unquote(token[0].rstrip(";"))
-            if name.startswith("("):
+            raw = token[0].rstrip(";").lstrip("(").rstrip(")")
+            # "(SELECT ..." is a subquery (its FROM is scanned separately);
+            # "(contracts)" is a parenthesised table and is still a table.
+            if not raw or raw.lower() in ("select", "with", "values"):
                 continue
-            tables.add(name)
+            tables.add(_unquote(raw))
     return tables
 
 
@@ -237,11 +227,13 @@ def run_readonly(con: sqlite3.Connection, sql: str):
             f"SEC-SELECT-03: query references non-view tables: {bad}")
     cur = con.cursor()
     try:
-        with views_only(con, ALLOWED_VIEWS, _VIEW_BACKING_TABLES):
+        with views_only(con, ALLOWED_VIEWS) as denied:
             cur.execute(sql)
             cols = [d[0] for d in (cur.description or [])]
-            rows = cur.fetchmany(MAX_ROWS + 1)
+            rows = cur.fetchmany(MAX_ROWS)
     except sqlite3.DatabaseError as e:
-        raise GatewayError(
-            f"SEC-SELECT-03: blocked by view allowlist ({e})") from e
-    return cols, rows[:MAX_ROWS]
+        if denied:
+            raise GatewayError(
+                f"SEC-SELECT-03: denied by database authorizer: {sorted(set(denied))}") from e
+        raise GatewayError(f"SEC-SELECT-01: query failed ({e})") from e
+    return cols, rows

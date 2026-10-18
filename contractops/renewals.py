@@ -1,7 +1,7 @@
 """Renewal prioritizer: ranks renewals by value x risk x days-to-expiry.
 
 priority = 100 * (0.40 * value_norm + 0.35 * risk_norm + 0.25 * urgency)
-  value_norm = annual_value / 1_000_000
+  value_norm = min(annual_value / 1_000_000, 1.0)   (keeps the score on 0..100)
   risk_norm  = contract risk score / 100
   urgency    = max(0, 1 - days_to_expiry / 180); already-expired => 1.0
 """
@@ -22,7 +22,7 @@ def days_to_expiry(expiry_date: str, ref_date: str) -> int:
 def priority(annual_value: float, risk_score: float,
              expiry_date: str, ref_date: str) -> dict:
     days = days_to_expiry(expiry_date, ref_date)
-    value_norm = annual_value / VALUE_NORM
+    value_norm = min(annual_value / VALUE_NORM, 1.0)
     risk_norm = risk_score / 100.0
     if days < 0:
         urgency = 1.0

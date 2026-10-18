@@ -12,8 +12,7 @@ import pytest
 from contractops.authz import views_only
 from contractops.pii import PIIScrubber
 from contractops.telemetry import seed_db
-from contractops.views import (ALLOWED_VIEWS, GatewayError, _VIEW_BACKING_TABLES,
-                               create_views, run_readonly, MAX_ROWS)
+from contractops.views import ALLOWED_VIEWS, MAX_ROWS, GatewayError, create_views, run_readonly
 
 
 @pytest.fixture()
@@ -75,31 +74,31 @@ def test_backstop_allows_legit_small_query(db):
 
 # ---- authorizer backstop (independent of text checks) ----------------------
 def test_authorizer_denies_write(db):
-    with views_only(db, ALLOWED_VIEWS, _VIEW_BACKING_TABLES):
+    with views_only(db, ALLOWED_VIEWS):
         with pytest.raises(sqlite3.DatabaseError):
             db.execute("DELETE FROM contracts")
 
 
 def test_authorizer_denies_ddl(db):
-    with views_only(db, ALLOWED_VIEWS, _VIEW_BACKING_TABLES):
+    with views_only(db, ALLOWED_VIEWS):
         with pytest.raises(sqlite3.DatabaseError):
             db.execute("DROP TABLE contracts")
 
 
 def test_authorizer_denies_sqlite_master(db):
-    with views_only(db, ALLOWED_VIEWS, _VIEW_BACKING_TABLES):
+    with views_only(db, ALLOWED_VIEWS):
         with pytest.raises(sqlite3.DatabaseError):
             db.execute("SELECT name FROM sqlite_master").fetchall()
 
 
 def test_authorizer_allows_view_reads(db):
-    with views_only(db, ALLOWED_VIEWS, _VIEW_BACKING_TABLES):
+    with views_only(db, ALLOWED_VIEWS):
         n = db.execute("SELECT COUNT(*) FROM v_contract_risk").fetchone()[0]
     assert n == 12
 
 
 def test_authorizer_is_cleared_after_block(db):
-    with views_only(db, ALLOWED_VIEWS, _VIEW_BACKING_TABLES):
+    with views_only(db, ALLOWED_VIEWS):
         pass
     # DDL works again outside the block (create_views uses it).
     db.execute("CREATE TABLE IF NOT EXISTS _probe (x TEXT)")
@@ -136,4 +135,4 @@ def test_pii_keeps_dates_intact():
     text = "renewal due 2026-10-18, signed 2026-01-05"
     out, counts = PIIScrubber().scrub(text)
     assert out == text
-    assert counts == {"email": 0, "phone": 0, "ssn": 0}
+    assert counts == {"email": 0, "phone": 0, "ssn": 0, "card": 0}
