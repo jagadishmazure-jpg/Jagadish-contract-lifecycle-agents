@@ -226,6 +226,7 @@ def run_readonly(con: sqlite3.Connection, sql: str):
         raise GatewayError(
             f"SEC-SELECT-03: query references non-view tables: {bad}")
     cur = con.cursor()
+    denied: list[str] = []
     try:
         with views_only(con, ALLOWED_VIEWS) as denied:
             cur.execute(sql)
