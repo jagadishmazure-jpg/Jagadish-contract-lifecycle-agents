@@ -14,14 +14,31 @@ def _months(text: str):
     return int(m.group(1)) if m else None
 
 
+# "90 days notice", "ninety (90) days' written notice", "90 days prior written notice"
+_NOTICE_RE = re.compile(
+    r"(\d+)\)?\s*days?['\u2019]?\s*(?:prior\s+)?(?:written\s+)?(?:prior\s+)?notice")
+
+
 def _days_notice(text: str):
-    m = re.search(r"(\d+)\s*days?\s*(written\s*)?notice", text.lower())
+    m = _NOTICE_RE.search(text.lower())
     return int(m.group(1)) if m else None
 
 
 def _net_days(text: str):
-    m = re.search(r"net[ -]?(\d+)", text.lower())
+    t = text.lower()
+    m = re.search(r"net[ -]?(\d+)", t) or re.search(
+        r"(\d+)\s*days?\s*(?:from|after|of)\s*(?:the\s*)?(?:date\s*of\s*)?invoice", t)
     return int(m.group(1)) if m else None
+
+
+def _mutual(t: str) -> bool:
+    """'mutual' as a word, not negated ('not mutual', 'non-mutual')."""
+    return bool(re.search(r"(?<![\w-])mutual", t)) and not re.search(
+        r"\b(?:not|non)[\s-]+mutual", t)
+
+
+def _uncapped(t: str) -> bool:
+    return bool(re.search(r"\b(?:uncapped|unlimited|without\s+(?:a\s+)?cap|no\s+cap)\b", t))
 
 
 def _cure_days(text: str):
@@ -72,6 +89,10 @@ def _check(rule_id: str, text: str):
     if rule_id == "CLAUSE-LIAB-01":
         if "one-sided" in t:
             return True, "cap is one-sided"
+        if _uncapped(t):
+            return True, "liability is uncapped"
+        if not _mutual(t):
+            return True, "cap is not stated as mutual"
         months = _months(t)
         if months is not None and months < 12:
             return True, f"cap of {months} months is below 12-month floor"
@@ -90,9 +111,9 @@ def _check(rule_id: str, text: str):
             return True, f"opt-out notice of {notice} days is below 60-day floor"
         return False, "opt-out notice meets the floor"
     if rule_id == "CLAUSE-INDEM-04":
-        if "without cap" in t or "one-sided" in t:
+        if _uncapped(t) or "one-sided" in t:
             return True, "indemnity is uncapped or one-sided"
-        if "mutual" in t and "capped" in t:
+        if _mutual(t) and re.search(r"(?<!un)\bcapped\b", t):
             return False, "mutual and capped"
         return True, "indemnity terms are not mutual-and-capped"
     if rule_id == "CLAUSE-PAY-05":

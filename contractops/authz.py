@@ -1,66 +1,94 @@
-"""SQLite authorizer backstop for the SELECT-only gateway.
+"""Engine-level backstop for the SELECT-only gateway (SQLite authorizer).
 
-The gateway's text checks (SEC-SELECT-01/02) inspect the query string, which
-is inherently fragile: exotic SQL (comment tricks, quoted identifiers, comma
-joins) can evade string matching. This module adds a second, independent
-enforcement layer using SQLite's own authorizer callback.
+The regex gateway rejects writes and multi-statements, but text scanning
+cannot see every way SQLite names a table: comma joins, ``/**/`` comments
+in place of whitespace, and double-quoted identifiers all reach base tables
+or ``sqlite_master`` without a ``FROM <name>`` token for a regex to match.
 
-What the authorizer enforces (inside ``views_only``):
-  - Only SELECT statements may run (SQLITE_SELECT).
-  - Only READs are allowed, and only on the allowed views plus the base
-    tables that back them; scalar/aggregate SQL functions (COUNT, SUM,
-    ROUND, ...) are allowed. Everything else -- INSERT/UPDATE/DELETE,
-    DDL, PRAGMA, ATTACH/DETACH, and reads of sqlite_master -- is denied.
+While a gateway query runs, SQLite itself is asked to authorize every
+access. Reads are allowed only on the allowlisted views, or on base-table
+columns that SQLite reads *on behalf of* one of those views (the
+authorizer's view-name argument names an allowed view). A base-table read
+with no view name is a direct read and is denied. The schema table is
+always denied, as are pragmas, writes and ``load_extension``. All of this
+happens before the statement executes, independent of any text check.
 
-Why the backing tables are allowed: SQLite expands a view into its base
-tables during query preparation, so denying READ on a backing table would
-break the view itself (verified empirically: the authorizer sees the base
-table read when a view is queried). Raw-table access in the *query text* is
-blocked one layer up by the gateway's FROM/JOIN allowlist (SEC-SELECT-03);
-the authorizer is the backstop for anything that check misses, and the sole
-enforcer for non-read operations.
-
-Denied operations raise ``sqlite3.DatabaseError`` ("... is prohibited"),
-which the gateway maps to SEC-SELECT-03.
+One narrow exception: SQLite reports a read with an empty column name and
+no view name for a table that supplies no columns (one side of a view
+self-join, or ``count(*)``). No column data is returned, so it is allowed
+only for tables that sit behind an allowed view. Residual: ``SELECT
+count(*) FROM <such table>`` returns a row count.
 """
+
 from __future__ import annotations
 
-import contextlib
 import sqlite3
+from contextlib import contextmanager
+
+_SQLITE_RECURSIVE = getattr(sqlite3, "SQLITE_RECURSIVE", 33)
+_ALWAYS_OK = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION, _SQLITE_RECURSIVE}
+_SCHEMA_TABLES = {"sqlite_master", "sqlite_schema", "sqlite_temp_master", "sqlite_temp_schema"}
+_DENIED_FUNCTIONS = {"load_extension"}
 
 
-@contextlib.contextmanager
-def views_only(con: sqlite3.Connection, allowed_views,
-               backing_tables=()):
-    """Install a restrictive SQLite authorizer for the block duration.
+def _tables_behind(conn, allowed):
+    """Base tables that SQLite reads on behalf of the allowed views."""
+    tables: set[str] = set()
 
-    Args:
-        con: the SQLite connection (the authorizer is per-connection).
-        allowed_views: view names the query text is restricted to.
-        backing_tables: base tables those views expand to (required --
-            without them the views themselves stop working).
+    def _record(action, arg1, _arg2, _db, source):
+        if action == sqlite3.SQLITE_READ and (source or "").lower() in allowed:
+            tables.add((arg1 or "").lower())
+        return sqlite3.SQLITE_OK
 
-    The authorizer is cleared on exit (``set_authorizer(None)``), so DDL
-    and engine reads outside the block are unaffected.
+    conn.set_authorizer(_record)
+    try:
+        for view in allowed:
+            try:
+                conn.execute(f'EXPLAIN SELECT * FROM "{view}"').fetchall()
+            except sqlite3.DatabaseError:
+                pass  # view not installed on this connection
+    finally:
+        conn.set_authorizer(None)
+    return tables - _SCHEMA_TABLES
+
+
+@contextmanager
+def views_only(conn: sqlite3.Connection, allowed_views):
+    """Authorize only reads of ``allowed_views`` for the duration of the block.
+
+    Yields a list that collects the names of denied objects, so the caller
+    can raise an error that cites them.
     """
-    readable = set(allowed_views) | set(backing_tables)
+    allowed = {v.lower() for v in allowed_views} - _SCHEMA_TABLES
+    underlying = _tables_behind(conn, allowed)
+    denied: list[str] = []
 
-    def _authorizer(action, arg1, arg2, dbname, source):
-        if action == sqlite3.SQLITE_SELECT:
-            return sqlite3.SQLITE_OK
-        if action == sqlite3.SQLITE_FUNCTION:
-            # Scalar/aggregate functions (COUNT, SUM, ROUND, date(...)).
-            # They cannot write; writes are denied by action type below.
-            return sqlite3.SQLITE_OK
+    def _authorize(action, arg1, arg2, _db, source):
         if action == sqlite3.SQLITE_READ:
-            # arg1 is the table/view name being read.
-            if arg1 in readable:
+            table = (arg1 or "").lower()
+            if table in _SCHEMA_TABLES:
+                denied.append(arg1)
+                return sqlite3.SQLITE_DENY
+            if table in allowed or (source or "").lower() in allowed:
                 return sqlite3.SQLITE_OK
+            # SQLite reports a read with an empty column name (and no view
+            # name) for a flattened view's table that supplies no columns,
+            # e.g. one side of a view self-join. No column data is read, so
+            # allow it for tables behind an allowed view.
+            if not arg2 and table in underlying:
+                return sqlite3.SQLITE_OK
+            denied.append(arg1 or "?")
             return sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_FUNCTION and (arg2 or "").lower() in _DENIED_FUNCTIONS:
+            denied.append(arg2)
+            return sqlite3.SQLITE_DENY
+        if action in _ALWAYS_OK:
+            return sqlite3.SQLITE_OK
+        denied.append(arg1 or arg2 or f"action {action}")
         return sqlite3.SQLITE_DENY
 
-    con.set_authorizer(_authorizer)
+    conn.set_authorizer(_authorize)
     try:
-        yield
+        yield denied
     finally:
-        con.set_authorizer(None)
+        conn.set_authorizer(None)

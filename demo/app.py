@@ -2,7 +2,7 @@
 try:
     import streamlit as st
 except ImportError:  # pragma: no cover
-    raise SystemExit("pip install streamlit, then streamlit run demo/app.py")
+    raise SystemExit("pip install streamlit, then streamlit run demo/app.py") from None
 
 from contractops import demo_helpers as dh
 from contractops.orchestrator import Orchestrator

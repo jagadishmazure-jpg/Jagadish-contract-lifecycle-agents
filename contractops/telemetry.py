@@ -73,12 +73,12 @@ def seed(con: sqlite3.Connection) -> None:
     )
 
     counterparties = [
-        ("CP-01", "Northgate Logistics", "logistics", "medium"),
-        ("CP-02", "Bluepine Foods", "food", "low"),
-        ("CP-03", "Meridian Health", "healthcare", "high"),
-        ("CP-04", "Kestrel Manufacturing", "manufacturing", "medium"),
+        ("CP-01", "Tervanne Logistics", "logistics", "medium"),
+        ("CP-02", "Sorrelbeck Foods", "food", "low"),
+        ("CP-03", "Veyrin Health", "healthcare", "high"),
+        ("CP-04", "Ondrel Manufacturing", "manufacturing", "medium"),
         ("CP-05", "Harborlight Retail", "retail", "low"),
-        ("CP-06", "Summit Telecom", "telecom", "medium"),
+        ("CP-06", "Corvane Telecom", "telecom", "medium"),
     ]
     cur.executemany("INSERT INTO counterparties VALUES (?,?,?,?)", counterparties)
 
